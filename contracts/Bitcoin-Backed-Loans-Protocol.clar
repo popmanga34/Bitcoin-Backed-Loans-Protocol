@@ -14,6 +14,12 @@
 (define-constant INTEREST_RATE u5)
 (define-constant LOAN_DURATION u144)
 
+(define-constant ERR_EXTENSION_NOT_ALLOWED (err u109))
+(define-constant ERR_MAX_EXTENSIONS_REACHED (err u110))
+(define-constant EXTENSION_FEE_RATE u10)
+(define-constant MAX_EXTENSIONS u3)
+(define-constant EXTENSION_DURATION u72)
+
 (define-data-var loan-id-nonce uint u0)
 (define-data-var total-loans-issued uint u0)
 (define-data-var total-active-loans uint u0)
@@ -260,5 +266,75 @@
       none
     )
     none
+  )
+)
+
+(define-map loan-extensions
+  uint
+  {
+    extensions-used: uint,
+    total-extension-fees: uint,
+    last-extension-block: uint
+  }
+)
+
+(define-public (extend-loan (loan-id uint))
+  (let (
+    (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+    (lender (unwrap! (get lender loan-data) ERR_LOAN_NOT_FOUND))
+    (extension-data (default-to {extensions-used: u0, total-extension-fees: u0, last-extension-block: u0} 
+                                (map-get? loan-extensions loan-id)))
+    (extension-fee (/ (* (get loan-amount loan-data) EXTENSION_FEE_RATE) u100))
+    (current-extensions (get extensions-used extension-data))
+    (blocks-until-expiry (- (+ (get start-block loan-data) (get duration loan-data)) stacks-block-height))
+  )
+    (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status loan-data) "active") ERR_LOAN_NOT_ACTIVE)
+    (asserts! (< current-extensions MAX_EXTENSIONS) ERR_MAX_EXTENSIONS_REACHED)
+    (asserts! (<= blocks-until-expiry u24) ERR_EXTENSION_NOT_ALLOWED)
+    
+    (try! (stx-transfer? extension-fee tx-sender lender))
+    
+    (map-set loans loan-id (merge loan-data {
+      duration: (+ (get duration loan-data) EXTENSION_DURATION)
+    }))
+    
+    (map-set loan-extensions loan-id {
+      extensions-used: (+ current-extensions u1),
+      total-extension-fees: (+ (get total-extension-fees extension-data) extension-fee),
+      last-extension-block: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-extension-info (loan-id uint))
+  (map-get? loan-extensions loan-id)
+)
+
+(define-read-only (can-extend-loan (loan-id uint))
+  (match (map-get? loans loan-id)
+    loan-data
+    (let (
+      (extension-data (default-to {extensions-used: u0, total-extension-fees: u0, last-extension-block: u0} 
+                                  (map-get? loan-extensions loan-id)))
+      (blocks-until-expiry (- (+ (get start-block loan-data) (get duration loan-data)) stacks-block-height))
+    )
+      (ok (and 
+        (is-eq (get status loan-data) "active")
+        (< (get extensions-used extension-data) MAX_EXTENSIONS)
+        (<= blocks-until-expiry u24)
+      ))
+    )
+    ERR_LOAN_NOT_FOUND
+  )
+)
+
+(define-read-only (calculate-extension-fee (loan-id uint))
+  (match (map-get? loans loan-id)
+    loan-data
+    (ok (/ (* (get loan-amount loan-data) EXTENSION_FEE_RATE) u100))
+    ERR_LOAN_NOT_FOUND
   )
 )
