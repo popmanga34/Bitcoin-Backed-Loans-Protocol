@@ -338,3 +338,101 @@
     ERR_LOAN_NOT_FOUND
   )
 )
+
+(define-constant ALERT_LIQUIDATION_RISK "liquidation-risk")
+(define-constant ALERT_PAYMENT_DUE "payment-due")
+(define-constant ALERT_LOAN_FUNDED "loan-funded")
+(define-constant ALERT_REPAYMENT_RECEIVED "repayment-received")
+
+(define-constant ERR_INVALID_ALERT_TYPE (err u201))
+(define-constant ERR_ALREADY_SUBSCRIBED (err u202))
+(define-constant ERR_NOT_SUBSCRIBED (err u203))
+
+(define-map user-alert-subscriptions
+  {user: principal, alert-type: (string-ascii 20)}
+  {subscribed: bool, subscription-block: uint}
+)
+
+(define-map loan-alerts
+  uint
+  {alert-count: uint, last-alert-block: uint, alert-types: (list 10 (string-ascii 20))}
+)
+
+(define-public (subscribe-to-alert (alert-type (string-ascii 20)))
+  (let (
+    (subscription-key {user: tx-sender, alert-type: alert-type})
+    (existing-subscription (map-get? user-alert-subscriptions subscription-key))
+  )
+    (asserts! (or 
+      (is-eq alert-type ALERT_LIQUIDATION_RISK)
+      (is-eq alert-type ALERT_PAYMENT_DUE)
+      (is-eq alert-type ALERT_LOAN_FUNDED)
+      (is-eq alert-type ALERT_REPAYMENT_RECEIVED)
+    ) ERR_INVALID_ALERT_TYPE)
+    
+    (asserts! (is-none existing-subscription) ERR_ALREADY_SUBSCRIBED)
+    
+    (map-set user-alert-subscriptions subscription-key {
+      subscribed: true,
+      subscription-block: stacks-block-height
+    })
+    
+    (print {event: "alert-subscription", user: tx-sender, alert-type: alert-type})
+    (ok true)
+  )
+)
+
+(define-public (unsubscribe-from-alert (alert-type (string-ascii 20)))
+  (let (
+    (subscription-key {user: tx-sender, alert-type: alert-type})
+    (existing-subscription (unwrap! (map-get? user-alert-subscriptions subscription-key) ERR_NOT_SUBSCRIBED))
+  )
+    (map-delete user-alert-subscriptions subscription-key)
+    (print {event: "alert-unsubscription", user: tx-sender, alert-type: alert-type})
+    (ok true)
+  )
+)
+
+(define-public (trigger-loan-alert (loan-id uint) (alert-type (string-ascii 20)))
+  (let (
+    (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+    (borrower (get borrower loan-data))
+    (lender (get lender loan-data))
+    (alert-data (default-to {alert-count: u0, last-alert-block: u0, alert-types: (list)} (map-get? loan-alerts loan-id)))
+    (new-alert-types (unwrap-panic (as-max-len? (append (get alert-types alert-data) alert-type) u10)))
+  )
+    (map-set loan-alerts loan-id {
+      alert-count: (+ (get alert-count alert-data) u1),
+      last-alert-block: stacks-block-height,
+      alert-types: new-alert-types
+    })
+    
+    (print {
+      event: "loan-alert",
+      loan-id: loan-id,
+      alert-type: alert-type,
+      borrower: borrower,
+      lender: lender,
+      block-height: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+(define-read-only (is-subscribed-to-alert (user principal) (alert-type (string-ascii 20)))
+  (is-some (map-get? user-alert-subscriptions {user: user, alert-type: alert-type}))
+)
+
+(define-read-only (get-loan-alert-history (loan-id uint))
+  (map-get? loan-alerts loan-id)
+)
+
+(define-read-only (get-user-subscriptions (user principal))
+  {
+    liquidation-risk: (is-subscribed-to-alert user ALERT_LIQUIDATION_RISK),
+    payment-due: (is-subscribed-to-alert user ALERT_PAYMENT_DUE),
+    loan-funded: (is-subscribed-to-alert user ALERT_LOAN_FUNDED),
+    repayment-received: (is-subscribed-to-alert user ALERT_REPAYMENT_RECEIVED)
+  }
+)
