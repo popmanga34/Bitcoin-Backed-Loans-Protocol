@@ -20,6 +20,13 @@
 (define-constant MAX_EXTENSIONS u3)
 (define-constant EXTENSION_DURATION u72)
 
+(define-constant AUCTION_DURATION u144)
+(define-constant MIN_BID_INCREMENT u1)
+(define-constant ERR_AUCTION_ENDED (err u301))
+(define-constant ERR_AUCTION_NOT_ACTIVE (err u302))
+(define-constant ERR_BID_TOO_LOW (err u303))
+(define-constant ERR_SELF_BID (err u304))
+
 (define-data-var loan-id-nonce uint u0)
 (define-data-var total-loans-issued uint u0)
 (define-data-var total-active-loans uint u0)
@@ -435,4 +442,107 @@
     loan-funded: (is-subscribed-to-alert user ALERT_LOAN_FUNDED),
     repayment-received: (is-subscribed-to-alert user ALERT_REPAYMENT_RECEIVED)
   }
+)
+
+
+(define-map loan-auctions
+  uint
+  {
+    auction-end-block: uint,
+    highest-bidder: (optional principal),
+    lowest-interest-rate: uint,
+    bid-count: uint,
+    auction-active: bool
+  }
+)
+
+(define-map auction-bids
+  {loan-id: uint, bidder: principal}
+  {
+    interest-rate: uint,
+    bid-block: uint,
+    funds-locked: uint
+  }
+)
+
+(define-public (start-auction (loan-id uint))
+  (let (
+    (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+  )
+    (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status loan-data) "pending") ERR_LOAN_NOT_ACTIVE)
+    
+    (map-set loan-auctions loan-id {
+      auction-end-block: (+ stacks-block-height AUCTION_DURATION),
+      highest-bidder: none,
+      lowest-interest-rate: INTEREST_RATE,
+      bid-count: u0,
+      auction-active: true
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (place-bid (loan-id uint) (interest-rate uint))
+  (let (
+    (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+    (auction-data (unwrap! (map-get? loan-auctions loan-id) ERR_AUCTION_NOT_ACTIVE))
+    (loan-amount (get loan-amount loan-data))
+    (current-lowest (get lowest-interest-rate auction-data))
+  )
+    (asserts! (not (is-eq tx-sender (get borrower loan-data))) ERR_SELF_BID)
+    (asserts! (get auction-active auction-data) ERR_AUCTION_NOT_ACTIVE)
+    (asserts! (< stacks-block-height (get auction-end-block auction-data)) ERR_AUCTION_ENDED)
+    (asserts! (< interest-rate current-lowest) ERR_BID_TOO_LOW)
+    
+    (try! (stx-transfer? loan-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set auction-bids {loan-id: loan-id, bidder: tx-sender} {
+      interest-rate: interest-rate,
+      bid-block: stacks-block-height,
+      funds-locked: loan-amount
+    })
+    
+    (map-set loan-auctions loan-id (merge auction-data {
+      highest-bidder: (some tx-sender),
+      lowest-interest-rate: interest-rate,
+      bid-count: (+ (get bid-count auction-data) u1)
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (finalize-auction (loan-id uint))
+  (let (
+    (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+    (auction-data (unwrap! (map-get? loan-auctions loan-id) ERR_AUCTION_NOT_ACTIVE))
+    (winning-bidder (get highest-bidder auction-data))
+    (winning-rate (get lowest-interest-rate auction-data))
+    (loan-amount (get loan-amount loan-data))
+  )
+    (asserts! (>= stacks-block-height (get auction-end-block auction-data)) ERR_AUCTION_NOT_ACTIVE)
+    (asserts! (get auction-active auction-data) ERR_AUCTION_ENDED)
+    
+    (if (is-some winning-bidder)
+      (begin
+        (try! (as-contract (stx-transfer? loan-amount tx-sender (get borrower loan-data))))
+        (map-set loans loan-id (merge loan-data {
+          lender: winning-bidder,
+          interest-rate: winning-rate,
+          start-block: stacks-block-height,
+          status: "active"
+        }))
+      )
+      (map-set loans loan-id (merge loan-data {status: "expired"}))
+    )
+    
+    (map-set loan-auctions loan-id (merge auction-data {auction-active: false}))
+    (ok true)
+  )
+)
+
+(define-read-only (get-auction-info (loan-id uint))
+  (map-get? loan-auctions loan-id)
 )
