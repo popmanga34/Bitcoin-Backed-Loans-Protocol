@@ -27,6 +27,10 @@
 (define-constant ERR_BID_TOO_LOW (err u303))
 (define-constant ERR_SELF_BID (err u304))
 
+(define-constant ERR_TRANSFER_NOT_ALLOWED (err u401))
+(define-constant ERR_INVALID_RECIPIENT (err u402))
+(define-constant ERR_TRANSFER_TO_SELF (err u403))
+
 (define-data-var loan-id-nonce uint u0)
 (define-data-var total-loans-issued uint u0)
 (define-data-var total-active-loans uint u0)
@@ -545,4 +549,72 @@
 
 (define-read-only (get-auction-info (loan-id uint))
   (map-get? loan-auctions loan-id)
+)
+
+
+(define-map loan-transfers
+  uint
+  {transfer-count: uint, last-transfer-block: uint, original-lender: principal}
+)
+
+(define-public (transfer-loan (loan-id uint) (recipient principal))
+  (let (
+    (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+    (current-lender (unwrap! (get lender loan-data) ERR_LOAN_NOT_FOUND))
+    (transfer-data (map-get? loan-transfers loan-id))
+  )
+    (asserts! (is-eq tx-sender current-lender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status loan-data) "active") ERR_TRANSFER_NOT_ALLOWED)
+    (asserts! (not (is-eq recipient tx-sender)) ERR_TRANSFER_TO_SELF)
+    (asserts! (not (is-eq recipient (get borrower loan-data))) ERR_INVALID_RECIPIENT)
+    
+    (map-set loans loan-id (merge loan-data {lender: (some recipient)}))
+    
+    (map-set lender-funds tx-sender 
+      (- (default-to u0 (map-get? lender-funds tx-sender)) (get loan-amount loan-data)))
+    (map-set lender-funds recipient 
+      (+ (default-to u0 (map-get? lender-funds recipient)) (get loan-amount loan-data)))
+    
+    (map-set loan-transfers loan-id 
+      (if (is-some transfer-data)
+        (let ((data (unwrap-panic transfer-data)))
+          {
+            transfer-count: (+ (get transfer-count data) u1),
+            last-transfer-block: stacks-block-height,
+            original-lender: (get original-lender data)
+          }
+        )
+        {
+          transfer-count: u1,
+          last-transfer-block: stacks-block-height,
+          original-lender: tx-sender
+        }
+      )
+    )
+    
+    (print {
+      event: "loan-transferred",
+      loan-id: loan-id,
+      from: tx-sender,
+      to: recipient,
+      block: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-transfer-history (loan-id uint))
+  (map-get? loan-transfers loan-id)
+)
+
+(define-read-only (can-transfer-loan (loan-id uint) (sender principal))
+  (match (map-get? loans loan-id)
+    loan-data
+    (ok (and 
+      (is-eq (unwrap-panic (get lender loan-data)) sender)
+      (is-eq (get status loan-data) "active")
+    ))
+    ERR_LOAN_NOT_FOUND
+  )
 )
