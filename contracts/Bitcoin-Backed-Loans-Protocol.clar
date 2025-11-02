@@ -618,3 +618,140 @@
     ERR_LOAN_NOT_FOUND
   )
 )
+
+
+(define-constant ERR_LOAN_NOT_PENDING (err u501))
+(define-constant ERR_OVERFUNDING (err u502))
+(define-constant ERR_LOAN_ALREADY_ACTIVE (err u503))
+(define-constant ERR_NO_CONTRIBUTION (err u504))
+(define-constant ERR_ALREADY_ACTIVATED (err u505))
+
+(define-map partial-fundings
+  uint
+  {
+    total-funded: uint,
+    target-amount: uint,
+    contributor-count: uint,
+    is-activated: bool,
+    activation-block: uint
+  }
+)
+
+(define-map lender-contributions
+  {loan-id: uint, lender: principal}
+  {
+    amount-contributed: uint,
+    contribution-block: uint,
+    share-percentage: uint
+  }
+)
+
+(define-map loan-contributors
+  uint
+  (list 50 principal)
+)
+
+(define-public (contribute-to-loan (loan-id uint) (contribution-amount uint))
+  (let (
+    (funding-data (default-to 
+      {total-funded: u0, target-amount: u0, contributor-count: u0, is-activated: false, activation-block: u0}
+      (map-get? partial-fundings loan-id)))
+    (new-total (+ (get total-funded funding-data) contribution-amount))
+    (contribution-key {loan-id: loan-id, lender: tx-sender})
+    (existing-contribution (map-get? lender-contributions contribution-key))
+    (contributors (default-to (list) (map-get? loan-contributors loan-id)))
+  )
+    (asserts! (> contribution-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (not (get is-activated funding-data)) ERR_LOAN_ALREADY_ACTIVE)
+    
+    (if (is-some existing-contribution)
+      (let ((contrib (unwrap-panic existing-contribution)))
+        (map-set lender-contributions contribution-key {
+          amount-contributed: (+ (get amount-contributed contrib) contribution-amount),
+          contribution-block: stacks-block-height,
+          share-percentage: u0
+        })
+      )
+      (begin
+        (map-set lender-contributions contribution-key {
+          amount-contributed: contribution-amount,
+          contribution-block: stacks-block-height,
+          share-percentage: u0
+        })
+        (map-set loan-contributors loan-id 
+          (unwrap-panic (as-max-len? (append contributors tx-sender) u50)))
+      )
+    )
+    
+    (map-set partial-fundings loan-id {
+      total-funded: new-total,
+      target-amount: (get target-amount funding-data),
+      contributor-count: (if (is-some existing-contribution) 
+                           (get contributor-count funding-data) 
+                           (+ (get contributor-count funding-data) u1)),
+      is-activated: false,
+      activation-block: u0
+    })
+    
+    (ok new-total)
+  )
+)
+
+(define-public (activate-partial-loan (loan-id uint) (target-amount uint))
+  (let (
+    (funding-data (unwrap! (map-get? partial-fundings loan-id) ERR_LOAN_NOT_FOUND))
+    (contributors (default-to (list) (map-get? loan-contributors loan-id)))
+  )
+    (asserts! (>= (get total-funded funding-data) target-amount) ERR_INVALID_AMOUNT)
+    (asserts! (not (get is-activated funding-data)) ERR_ALREADY_ACTIVATED)
+    
+    (update-contributor-shares loan-id (get total-funded funding-data) contributors)
+    
+    (map-set partial-fundings loan-id (merge funding-data {
+      is-activated: true,
+      activation-block: stacks-block-height,
+      target-amount: target-amount
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-private (update-contributor-shares (loan-id uint) (total-amount uint) (contributors (list 50 principal)))
+  (fold update-share-for-contributor contributors {loan-id: loan-id, total: total-amount})
+)
+
+(define-private (update-share-for-contributor (contributor principal) (context {loan-id: uint, total: uint}))
+  (let (
+    (loan-id (get loan-id context))
+    (total-amount (get total context))
+    (contribution-key {loan-id: loan-id, lender: contributor})
+    (contrib-data (unwrap-panic (map-get? lender-contributions contribution-key)))
+    (share-pct (/ (* (get amount-contributed contrib-data) u10000) total-amount))
+  )
+    (map-set lender-contributions contribution-key (merge contrib-data {
+      share-percentage: share-pct
+    }))
+    context
+  )
+)
+
+(define-read-only (get-funding-status (loan-id uint))
+  (map-get? partial-fundings loan-id)
+)
+
+(define-read-only (get-lender-contribution (loan-id uint) (lender principal))
+  (map-get? lender-contributions {loan-id: loan-id, lender: lender})
+)
+
+(define-read-only (get-all-contributors (loan-id uint))
+  (map-get? loan-contributors loan-id)
+)
+
+(define-read-only (calculate-funding-progress (loan-id uint) (target uint))
+  (match (map-get? partial-fundings loan-id)
+    funding-data
+    (ok (/ (* (get total-funded funding-data) u100) target))
+    (ok u0)
+  )
+)
